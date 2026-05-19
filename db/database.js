@@ -7,12 +7,15 @@ const DB_PATH = path.join(__dirname, '..', 'data.json');
 
 function loadDB() {
   if (!fs.existsSync(DB_PATH)) {
-    return { users: [], alertLog: [] };
+    return { users: [], alertLog: [], hostnameAliases: {}, heartbeat: {} };
   }
   try {
-    return JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
+    const db = JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
+    if (!db.hostnameAliases || typeof db.hostnameAliases !== 'object') db.hostnameAliases = {};
+    if (!db.heartbeat || typeof db.heartbeat !== 'object') db.heartbeat = {};
+    return db;
   } catch (_) {
-    return { users: [], alertLog: [] };
+    return { users: [], alertLog: [], hostnameAliases: {}, heartbeat: {} };
   }
 }
 
@@ -60,5 +63,41 @@ module.exports = {
   getRecentAlerts() {
     const db = loadDB();
     return [...db.alertLog].reverse().slice(0, 50);
+  },
+
+  getAliases() {
+    const db = loadDB();
+    return db.hostnameAliases || {};
+  },
+
+  setAlias(ip, alias) {
+    const db = loadDB();
+    if (!db.hostnameAliases || typeof db.hostnameAliases !== 'object') db.hostnameAliases = {};
+    if (!alias) {
+      delete db.hostnameAliases[ip];
+    } else {
+      db.hostnameAliases[ip] = alias;
+    }
+    saveDB(db);
+  },
+
+  getHeartbeatState() {
+    const db = loadDB();
+    const state = db.heartbeat || {};
+    return {
+      lastSeenAt: state.lastSeenAt || null,
+      lastStatus: state.lastStatus || null,
+      lastTransitionAt: state.lastTransitionAt || null,
+      lastNotificationAt: state.lastNotificationAt || null,
+      secret: state.secret || null,
+    };
+  },
+
+  setHeartbeatState(nextState) {
+    const db = loadDB();
+    const prev = db.heartbeat && typeof db.heartbeat === 'object' ? db.heartbeat : {};
+    db.heartbeat = { ...prev, ...nextState };
+    saveDB(db);
+    return db.heartbeat;
   },
 };

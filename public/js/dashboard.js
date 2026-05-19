@@ -10,7 +10,11 @@ const PORT_NAMES = {
 
 /* ─── State ─────────────────────────────────────────────────────────────── */
 let pollTimer    = null;
+let mediumPollTimer = null;
+let connectionsPollTimer = null;
 const pollInterval = 3000;
+const mediumPollInterval = 12000;
+const connectionsPollInterval = 4000;
 let rxPeak = 0, txPeak = 0;
 let prevRxBytes = {}, prevTxBytes = {}, prevTimestamp = null;
 let chartRx, chartTx;
@@ -22,6 +26,12 @@ let isOnline = true;
 let activeTab = 'dashboard';
 let allLeases = [];
 let allConns  = [];
+let hostnameAliases = {};
+let ptrMap = {};
+let lastDhcpRendered = [];
+let arpCacheMap = {};
+let arpCacheAt = 0;
+const ARP_CACHE_TTL_MS = 15000;
 
 /* ─── Init ───────────────────────────────────────────────────────────────── */
 document.addEventListener('DOMContentLoaded', async () => {
@@ -33,11 +43,92 @@ document.addEventListener('DOMContentLoaded', async () => {
     window.location.href = '/';
     return;
   }
+  await loadAliases();
   initCharts();
   gsap.to('.fade-up', { opacity: 1, y: 0, duration: .5, ease: 'power3.out', stagger: .06, delay: .1 });
   startPolling();
   startStatusMonitor();
 });
+
+function isValidIpv4(ip) {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(ip || '');
+}
+
+function isSubnet50(ip) {
+  return String(ip || '').startsWith('192.168.50.');
+}
+
+function isSubnet10(ip) {
+  return String(ip || '').startsWith('192.168.10.');
+}
+
+function isLocalIp(ip) {
+  return isSubnet50(ip) || isSubnet10(ip);
+}
+
+function escapeHtml(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function resolveDisplayHostname(ip, leaseHostname) {
+  const direct = String(leaseHostname || '').trim();
+  if (direct && direct !== '—') return direct;
+  const alias = String(hostnameAliases[ip] || '').trim();
+  if (alias) return alias;
+  const ptr = String(ptrMap[ip] || '').trim();
+  if (ptr) return ptr;
+  return '-';
+}
+
+async function loadAliases() {
+  try {
+    const data = await fetch('/api/aliases').then(r => r.json());
+    hostnameAliases = (data && data.aliases && typeof data.aliases === 'object') ? data.aliases : {};
+  } catch (_) {
+    hostnameAliases = {};
+  }
+}
+
+async function resolveMissingPtr(ips) {
+  const targets = Array.from(new Set((ips || []).filter(ip => isValidIpv4(ip) && !ptrMap[ip] && !hostnameAliases[ip])));
+  if (!targets.length) return;
+  try {
+    const out = await fetch('/api/aliases/resolve-batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ips: targets }),
+    }).then(r => r.json());
+    if (out && out.map && typeof out.map === 'object') {
+      ptrMap = { ...ptrMap, ...out.map };
+    }
+  } catch (_) {}
+}
+
+async function editAlias(ip, currentName) {
+  const curAlias = hostnameAliases[ip] || (currentName === '-' ? '' : currentName || '');
+  const next = window.prompt(`Alias hostname untuk ${ip}`, curAlias);
+  if (next === null) return;
+  try {
+    const res = await fetch('/api/aliases', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ip, alias: next.trim() }),
+    }).then(r => r.json());
+    if (res.error) throw new Error(res.error);
+    await loadAliases();
+    renderDhcpTable(lastDhcpRendered.length ? lastDhcpRendered : allLeases);
+    await fetchIpUsage();
+    showToast('Alias hostname tersimpan.', 2500);
+  } catch (err) {
+    showToast('Gagal simpan alias: ' + err.message, 4000);
+  }
+}
+window.editAlias = editAlias;
 
 /* ─── Tab Switching ──────────────────────────────────────────────────────── */
 function switchTab(tab) {
@@ -163,6 +254,18 @@ function updateTrafficUI(rxBps, txBps) {
 
 /* ─── Health UI ─────────────────────────────────────────────────────────── */
 function updateHealthUI(data) {
+  function normalizeTemp(v) {
+    if (!Number.isFinite(v)) return null;
+    if (v > 200) return v / 10;
+    return v;
+  }
+
+  function normalizeVoltage(v) {
+    if (!Number.isFinite(v)) return null;
+    if (v > 100) return v / 10;
+    return v;
+  }
+
   let boardTemp = null, cpuTemp = null, voltage = null;
   if (Array.isArray(data)) {
     data.forEach(item => {
@@ -177,6 +280,10 @@ function updateHealthUI(data) {
     cpuTemp   = parseFloat(data['cpu-temperature'] || NaN);
     voltage   = parseFloat(data['voltage'] || NaN);
   }
+
+  boardTemp = normalizeTemp(boardTemp);
+  cpuTemp = normalizeTemp(cpuTemp);
+  voltage = normalizeVoltage(voltage);
 
   if (boardTemp !== null && !isNaN(boardTemp)) {
     document.getElementById('board-temp-val').textContent = boardTemp.toFixed(1);
@@ -199,10 +306,8 @@ function updateHealthUI(data) {
   }
 
   if (voltage !== null && !isNaN(voltage)) {
-    const displayV = voltage > 100 ? (voltage / 1000).toFixed(2) : voltage.toFixed(2);
-    document.getElementById('voltage-val').textContent = displayV;
-    const normalV = voltage > 100 ? voltage / 1000 : voltage;
-    const pct = Math.min((normalV / 28) * 100, 100);
+    document.getElementById('voltage-val').textContent = voltage.toFixed(2);
+    const pct = Math.min((voltage / 28) * 100, 100);
     gsap.to('#voltage-bar', { width: pct + '%', duration: .6, ease: 'power2.out' });
   }
 }
@@ -334,10 +439,12 @@ async function fetchDhcp() {
   badge.textContent = allLeases.length;
   badge.style.display = allLeases.length ? 'inline' : 'none';
 
+  await resolveMissingPtr(allLeases.map(l => l['address'] || l['ip-address']).filter(isValidIpv4));
   renderDhcpTable(allLeases);
 }
 
 function renderDhcpTable(leases) {
+  lastDhcpRendered = leases;
   if (!leases.length) {
     document.getElementById('dhcp-tbody').innerHTML = `<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:28px;">Tidak ada data lease.</td></tr>`;
     return;
@@ -345,7 +452,8 @@ function renderDhcpTable(leases) {
   document.getElementById('dhcp-tbody').innerHTML = leases.map(l => {
     const ip       = l['address'] || l['ip-address'] || '—';
     const mac      = l['mac-address'] || '—';
-    const hostname = l['host-name'] || l['hostname'] || l['active-host-name'] || '—';
+    const leaseHostname = l['host-name'] || l['hostname'] || l['active-host-name'] || '';
+    const hostname = resolveDisplayHostname(ip, leaseHostname);
     const server   = l['server'] || l['dhcp-server'] || '—';
     const status   = l['status'] || (l.dynamic === 'true' ? 'bound' : 'static');
     const expires  = l['expires-after'] || l['lease-time'] || '—';
@@ -357,7 +465,7 @@ function renderDhcpTable(leases) {
     return `<tr>
       <td style="font-family:monospace;color:#3b82f6;font-weight:600;">${ip}</td>
       <td style="font-family:monospace;color:#94a3b8;font-size:.78rem;">${mac}</td>
-      <td style="color:#e2e8f0;">${hostname}</td>
+      <td style="color:#e2e8f0;"><button type="button" onclick="editAlias('${escapeHtml(ip)}','${escapeHtml(hostname)}')" style="background:none;border:none;color:#e2e8f0;cursor:pointer;padding:0;text-align:left;">${escapeHtml(hostname)}</button></td>
       <td style="font-family:monospace;color:var(--muted);font-size:.78rem;">${server}</td>
       <td>${badge}</td>
       <td style="font-family:monospace;color:var(--muted);font-size:.78rem;">${expires}</td>
@@ -371,7 +479,7 @@ function filterDhcp() {
   renderDhcpTable(allLeases.filter(l =>
     (l['address']||'').toLowerCase().includes(q) ||
     (l['mac-address']||'').toLowerCase().includes(q) ||
-    (l['host-name']||l['hostname']||l['active-host-name']||'').toLowerCase().includes(q) ||
+    resolveDisplayHostname(l['address'] || l['ip-address'] || '', l['host-name']||l['hostname']||l['active-host-name']||'').toLowerCase().includes(q) ||
     (l['server']||'').toLowerCase().includes(q)
   ));
 }
@@ -503,11 +611,8 @@ async function fetchAll() {
       fetchResources(),
       fetchInterfaces(),
       fetchHealth(),
-      fetchDhcp(),
-      fetchConnections(),
-      fetchFirewallAndLogs(),
-      fetchDnsCache(),
       fetchHistory(),
+      fetchHeartbeatStatus(),
     ]);
     await fetchIpUsage();
     document.getElementById('last-update').textContent =
@@ -517,9 +622,81 @@ async function fetchAll() {
   }
 }
 
+async function fetchHeartbeatStatus() {
+  try {
+    const data = await fetch('/api/heartbeat/status').then(r => r.json());
+    if (!data.ok) return;
+
+    const status = data.status || 'UNKNOWN';
+    const statusEl = document.getElementById('hb-status');
+    if (statusEl) {
+      statusEl.textContent = status;
+      statusEl.style.color = status === 'UP' ? '#22c55e' : status === 'DOWN' ? '#ef4444' : '#e2e8f0';
+    }
+
+    const lastSeenEl = document.getElementById('hb-last-seen');
+    if (lastSeenEl) {
+      if (!data.last_seen) {
+        lastSeenEl.textContent = 'Belum ada';
+      } else {
+        const dt = new Date(data.last_seen);
+        lastSeenEl.textContent = Number.isFinite(dt.getTime())
+          ? dt.toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })
+          : 'Belum ada';
+      }
+    }
+
+    const diffEl = document.getElementById('hb-diff');
+    if (diffEl) {
+      diffEl.textContent = data.seconds_since_last_seen == null
+        ? '-'
+        : `${data.seconds_since_last_seen} detik`;
+    }
+
+    const timeoutEl = document.getElementById('hb-timeout');
+    if (timeoutEl) timeoutEl.textContent = `${data.tolerance_seconds} detik (1 menit)`;
+
+    const endpointEl = document.getElementById('hb-endpoint');
+    if (endpointEl) endpointEl.textContent = data.endpoint_url || '-';
+
+    const secretEl = document.getElementById('hb-secret');
+    if (secretEl) secretEl.textContent = data.secret || '-';
+
+    const commandEl = document.getElementById('hb-command');
+    if (commandEl) {
+      commandEl.textContent = data.scheduler_example || '/tool fetch url="https://domainkamu.com/heartbeat/ping.php?secret=SECRET_ACAK" keep-result=no';
+    }
+  } catch (_) {}
+}
+
 function startPolling() {
   fetchAll();
   pollTimer = setInterval(fetchAll, pollInterval);
+
+  fetchMediumData();
+  mediumPollTimer = setInterval(fetchMediumData, mediumPollInterval);
+
+  fetchConnectionsSafe();
+  connectionsPollTimer = setInterval(fetchConnectionsSafe, connectionsPollInterval);
+}
+
+async function fetchMediumData() {
+  try {
+    await Promise.all([
+      fetchDhcp(),
+      fetchDnsCache(),
+    ]);
+  } catch (err) {
+    showToast('Error: ' + err.message);
+  }
+}
+
+async function fetchConnectionsSafe() {
+  try {
+    await fetchConnections();
+  } catch (err) {
+    showToast('Error: ' + err.message);
+  }
 }
 
 /* ─── Status Monitor ─────────────────────────────────────────────────────── */
@@ -684,31 +861,27 @@ function getInternetIp() {
 async function fetchIpUsage() {
   try {
     const INTERNET_IP = getInternetIp();
-    const arpData = await fetch('/api/mikrotik/arp').then(r => r.json()).catch(()=>[]);
-    const arpList = Array.isArray(arpData) ? arpData : [];
-    const arpMap = {};
-    arpList.forEach(a => { if (a.address) arpMap[a.address] = a.interface; });
+    const arpMap = await getArpMapCached();
 
     const hostMap = {};
     allLeases.forEach(l => {
       const ip = l.address || l['ip-address'];
       if (ip) {
-        hostMap[ip] = l['host-name'] || l.hostname || l['active-host-name'] || '—';
+        hostMap[ip] = l['host-name'] || l.hostname || l['active-host-name'] || '';
       }
     });
-    // Set explicit hostname for Internet gateway
     hostMap[INTERNET_IP] = 'Internet';
 
     const ipStats = {};
     
-    // Pin Internet gateway row
     ipStats[INTERNET_IP] = { rx:0, tx:0, interface: INTERNET_IFACE, hostname: 'Internet' };
     
     allConns.forEach(c => {
       const srcFull = c['src-address'] || '';
       const srcSplit = srcFull.lastIndexOf(':');
       const ip = srcSplit > 0 ? srcFull.substring(0, srcSplit) : srcFull;
-      if (!ip || ip.includes(':')) return; // skip IPv6 or invalid
+      if (!ip || ip.includes(':')) return;
+      if (!isLocalIp(ip)) return;
       
       const rx = parseInt(c['repl-bytes'] || 0); // RX is reply bytes
       const tx = parseInt(c['orig-bytes'] || 0); // TX is original bytes
@@ -717,7 +890,7 @@ async function fetchIpUsage() {
           ipStats[ip] = { 
               rx:0, tx:0, 
               interface: arpMap[ip] || (ip === INTERNET_IP ? INTERNET_IFACE : '—'), 
-              hostname: hostMap[ip] || '—' 
+              hostname: resolveDisplayHostname(ip, hostMap[ip] || '')
           };
       }
       ipStats[ip].rx += rx;
@@ -744,33 +917,29 @@ async function fetchIpUsage() {
 
       const hasMovement = (rxRate > 0 || txRate > 0);
       const isInternet = ip === INTERNET_IP;
-
-      // Show only currently moving traffic rows; keep Internet row pinned.
       const visible = isInternet || hasMovement;
-
       return { ip, st, rxRate, txRate, visible };
     }).filter(r => r.visible);
 
-    // sort by real-time movement first, then total bytes
-    let ips = rows
-      .sort((a, b) => ((b.rxRate + b.txRate) - (a.rxRate + a.txRate)) || ((b.st.rx + b.st.tx) - (a.st.rx + a.st.tx)))
-      .map(r => r.ip);
-
-    // Pin Internet to top
-    if (ips.includes(INTERNET_IP)) {
-      ips = ips.filter(ip => ip !== INTERNET_IP);
-      ips.unshift(INTERNET_IP);
-    }
+    await resolveMissingPtr(rows.map(r => r.ip));
+    rows.forEach(r => { r.st.hostname = resolveDisplayHostname(r.ip, r.st.hostname); });
+    const sortedRows = rows.sort((a, b) => ((b.rxRate + b.txRate) - (a.rxRate + a.txRate)) || ((b.st.rx + b.st.tx) - (a.st.rx + a.st.tx)));
+    const internetRows = sortedRows.filter(r => r.ip === INTERNET_IP);
+    const group50 = sortedRows.filter(r => r.ip !== INTERNET_IP && isSubnet50(r.ip));
+    const group10 = sortedRows.filter(r => isSubnet10(r.ip));
+    const finalRows = [...internetRows, ...group50, ...group10];
     
-    document.getElementById('queue-count').textContent = `${ips.length} IP`;
+    document.getElementById('queue-count').textContent = `${finalRows.length} IP`;
 
-    if (!ips.length) {
+    if (!finalRows.length) {
       tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:28px;">Tidak ada data koneksi.</td></tr>`;
       return;
     }
 
-    tbody.innerHTML = ips.map(ip => {
-      const st = ipStats[ip];
+    const rowHtmlByIp = {};
+    const buildRow = (row) => {
+      const ip = row.ip;
+      const st = row.st;
       let rxRHtml = '<span style="color:var(--muted)">—</span>';
       let txRHtml = '<span style="color:var(--muted)">—</span>';
 
@@ -779,7 +948,6 @@ async function fetchIpUsage() {
         if (dt > 0) {
           let rxRate = ((st.rx - prevIpUsageBytes[ip].rx) / dt) * 8;
           let txRate = ((st.tx - prevIpUsageBytes[ip].tx) / dt) * 8;
-          // Ignore negative rates which happen if connections drop and bytes reset
           if (rxRate >= 0 && txRate >= 0) {
               const rxR = fmtRate(rxRate);
               const txR = fmtRate(txRate);
@@ -791,14 +959,27 @@ async function fetchIpUsage() {
 
       return `<tr>
         <td style="font-family:monospace;color:#3b82f6;font-weight:600;">${ip}</td>
-        <td style="color:#e2e8f0;font-size:.78rem;">${st.hostname}</td>
+        <td style="color:#e2e8f0;font-size:.78rem;"><button type="button" onclick="editAlias('${escapeHtml(ip)}','${escapeHtml(st.hostname)}')" style="background:none;border:none;color:#e2e8f0;cursor:pointer;padding:0;text-align:left;">${escapeHtml(st.hostname)}</button></td>
         <td style="color:#e2e8f0;font-size:.78rem;">${st.interface}</td>
         <td>${rxRHtml}</td>
         <td>${txRHtml}</td>
         <td style="font-family:monospace;color:#94a3b8;font-size:.75rem;">${fmt(st.rx)}</td>
         <td style="font-family:monospace;color:#94a3b8;font-size:.75rem;">${fmt(st.tx)}</td>
       </tr>`;
-    }).join('');
+    };
+    finalRows.forEach(r => { rowHtmlByIp[r.ip] = buildRow(r); });
+
+    const assembled = [];
+    internetRows.forEach(r => assembled.push(rowHtmlByIp[r.ip]));
+    if (group50.length) {
+      assembled.push('<tr><td colspan="7" style="font-size:.72rem;color:#93c5fd;background:rgba(59,130,246,.08);font-weight:700;">R15 / Pribadi (192.168.50.0/24)</td></tr>');
+      group50.forEach(r => assembled.push(rowHtmlByIp[r.ip]));
+    }
+    if (group10.length) {
+      assembled.push('<tr><td colspan="7" style="font-size:.72rem;color:#86efac;background:rgba(34,197,94,.08);font-weight:700;">Samara (192.168.10.0/24)</td></tr>');
+      group10.forEach(r => assembled.push(rowHtmlByIp[r.ip]));
+    }
+    tbody.innerHTML = assembled.join('');
 
     prevIpUsageBytes = Object.fromEntries(Object.entries(ipStats).map(([k,v]) => [k, {rx:v.rx, tx:v.tx}]));
     prevIpTimestamp = now;
@@ -806,6 +987,23 @@ async function fetchIpUsage() {
   } catch (err) {
     document.getElementById('queue-tbody').innerHTML = `<tr><td colspan="7" style="text-align:center;color:#f87171;padding:28px;">Gagal: ${err.message}</td></tr>`;
   }
+}
+
+async function getArpMapCached() {
+  const now = Date.now();
+  if (now - arpCacheAt <= ARP_CACHE_TTL_MS && Object.keys(arpCacheMap).length) {
+    return arpCacheMap;
+  }
+
+  const arpData = await fetch('/api/mikrotik/arp').then(r => r.json()).catch(() => []);
+  const arpList = Array.isArray(arpData) ? arpData : [];
+  const nextMap = {};
+  arpList.forEach((a) => {
+    if (a && a.address) nextMap[a.address] = a.interface;
+  });
+  arpCacheMap = nextMap;
+  arpCacheAt = now;
+  return arpCacheMap;
 }
 
 /* ─── Fetch: Firewall Stats + System Log ────────────────────────────────────── */

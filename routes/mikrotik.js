@@ -59,9 +59,24 @@ router.get('/health', async (req, res) => {
   try {
     let data;
     try {
-      data = await getHealthMetrics(req.session.routerIp);
-      if (!Array.isArray(data) || data.length === 0) {
-        data = await mikrotikFetch(req.session.routerIp, '/rest/system/health');
+      const snmpData = await getHealthMetrics(req.session.routerIp);
+      const restData = await mikrotikFetch(req.session.routerIp, '/rest/system/health').catch(() => []);
+
+      if (!Array.isArray(snmpData) || snmpData.length === 0) {
+        data = restData;
+      } else if (Array.isArray(restData) && restData.length > 0) {
+        const byName = new Map();
+        for (const item of restData) {
+          if (!item || !item.name) continue;
+          byName.set(String(item.name).toLowerCase(), item);
+        }
+        for (const item of snmpData) {
+          if (!item || !item.name) continue;
+          byName.set(String(item.name).toLowerCase(), item);
+        }
+        data = Array.from(byName.values());
+      } else {
+        data = snmpData;
       }
     } catch (_) {
       data = await mikrotikFetch(req.session.routerIp, '/rest/system/health');

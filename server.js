@@ -24,6 +24,7 @@ const { router: alertsRouter, startHealthMonitor,
         registerRouter }                                    = require('./routes/alerts');
 const { router: historyRouter, checkThresholds }           = require('./routes/history');
 const settingsRouter                                        = require('./routes/settings');
+const aliasesRouter                                         = require('./routes/aliases');
 const requireAuth                                           = require('./middleware/requireAuth');
 const { resolveRouterHost }                                 = require('./utils/routerHost');
 
@@ -58,6 +59,7 @@ app.use('/api/mikrotik',  requireAuth, mikrotikRouter);
 app.use('/api/alerts',    requireAuth, alertsRouter);
 app.use('/api/history',   requireAuth, historyRouter);
 app.use('/api/settings',  requireAuth, settingsRouter);
+app.use('/api/aliases',   requireAuth, aliasesRouter);
 
 app.get('/', (req, res) => {
   if (req.session && req.session.userId) return res.redirect('/dashboard');

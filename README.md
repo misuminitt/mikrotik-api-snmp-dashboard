@@ -68,6 +68,7 @@ Main features:
 - Firewall stats and system logs viewer
 - DNS cache monitoring
 - History and threshold alert timeline
+- Heartbeat monitoring (push mode for CGNAT sites) with DOWN/UP transition alerts
 - Hybrid data mode: SNMP for lightweight periodic metrics, REST API for detailed operational data
 
 ## Author

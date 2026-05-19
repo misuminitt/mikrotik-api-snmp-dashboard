@@ -129,12 +129,22 @@ async function getResourceMetrics(routerIp) {
       freeMemory = Math.max(0, totalMemory - usedMemory);
     }
 
-    return {
+    const result = {
       'cpu-load': cpuLoad,
       'total-memory': totalMemory,
       'free-memory': freeMemory,
       'uptime': ticksToUptime(uptimeTicks),
     };
+
+    if (!Number.isFinite(result['cpu-load']) || result['cpu-load'] < 0) {
+      throw new Error('SNMP CPU load invalid');
+    }
+
+    if (!Number.isFinite(result['total-memory']) || result['total-memory'] <= 0) {
+      throw new Error('SNMP memory invalid');
+    }
+
+    return result;
   } finally {
     session.close();
   }

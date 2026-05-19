@@ -1,0 +1,17 @@
+[Unit]
+Description=MikroTik Dashboard (Node.js)
+After=network.target
+
+[Service]
+Type=simple
+User=pony3437
+WorkingDirectory=/home/pony3437/mikrotik-dashboard
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node --env-file=.env server.js
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/pony3437/logs/mikrotik-dashboard.out.log
+StandardError=append:/home/pony3437/logs/mikrotik-dashboard.err.log
+
+[Install]
+WantedBy=multi-user.target
