@@ -71,5 +71,11 @@ Main features:
 - Heartbeat monitoring (push mode for CGNAT sites) with DOWN/UP transition alerts
 - Hybrid data mode: SNMP for lightweight periodic metrics, REST API for detailed operational data
 
+## Shared Hosting (Cron-Only)
+Jika shared hosting tidak stabil untuk publish Node.js app, gunakan mode heartbeat berbasis PHP+cron.
+
+Lihat panduan:
+- `cron/README_CRON.md`
+
 ## Author
 misuminitt
